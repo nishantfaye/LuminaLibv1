@@ -526,9 +526,9 @@ docker compose up -d --build api
 
 **Live-tested proof:**
 ```
-✅ STORAGE_BACKEND=s3 → Book uploaded to MinIO
+STORAGE_BACKEND=s3 → Book uploaded to MinIO
    File stored at S3 key: 9a/9af6f29e...swap_s3-storage.txt
-✅ STORAGE_BACKEND=local → Restored, book uploaded to ./storage/
+STORAGE_BACKEND=local → Restored, book uploaded to ./storage/
    Zero code changes between the two configurations.
 ```
 
@@ -580,9 +580,9 @@ docker compose up -d --build api
 
 **Live-tested proof:**
 ```
-✅ LLM_PROVIDER=mock → Summary: "Summary: [uid:53dc9d40] This is a test book..."
+LLM_PROVIDER=mock → Summary: "Summary: [uid:53dc9d40] This is a test book..."
    (MockLLMService returns deterministic, word-based summary — instant, no GPU)
-✅ LLM_PROVIDER=llama → Summary: "Here is a summary of the book content..."
+LLM_PROVIDER=llama → Summary: "Here is a summary of the book content..."
    (LlamaLLMService calls Ollama API — real LLM inference)
 ```
 
@@ -655,23 +655,23 @@ All swap tests pass with **zero code changes** between configurations:
 
 ```
 ======================================================================
-🔄 COMPONENT SWAP VERIFICATION — 11/11 passed
+ COMPONENT SWAP VERIFICATION — 11/11 passed
 ======================================================================
-  ✅ STORAGE_BACKEND=s3     → Book uploaded to MinIO S3 bucket
-  ✅ LLM_PROVIDER=mock      → MockLLM summary detected (instant)
-  ✅ LLM_PROVIDER=openai    → Graceful fallback to mock (no API key)
-  ✅ Original config restored → API healthy, upload succeeded
+  STORAGE_BACKEND=s3     → Book uploaded to MinIO S3 bucket
+  LLM_PROVIDER=mock      → MockLLM summary detected (instant)
+  LLM_PROVIDER=openai    → Graceful fallback to mock (no API key)
+  Original config restored → API healthy, upload succeeded
 ======================================================================
-  Storage local→s3 :  1 config line change  ✅
-  LLM llama→mock   :  1 config line change  ✅
-  LLM llama→openai :  2 config lines        ✅  (provider + API key)
+  Storage local→s3 :  1 config line change  
+  LLM llama→mock   :  1 config line change  
+  LLM llama→openai :  2 config lines         (provider + API key)
   Business logic changes required: ZERO
 ======================================================================
 ```
 
 ---
 
-### 🔬 Try It Yourself — Step-by-Step Swap Tutorials
+###  Try It Yourself — Step-by-Step Swap Tutorials
 
 The following two tutorials let you **reproduce** the swaps on your own
 running stack.  Each tutorial is fully self-contained: open a terminal,
@@ -784,7 +784,7 @@ docker compose up -d --build api
 **What files were modified?**  Only `docker-compose.yml` (one value).
 No `.py` file was opened, edited, or redeployed.
 
-✅ **Result:** Storage backend swapped with a single config line.
+ **Result:** Storage backend swapped with a single config line.
 
 ---
 
@@ -926,7 +926,7 @@ sed -i '' 's/LLM_PROVIDER=openai/LLM_PROVIDER=llama/' docker-compose.yml
 docker compose up -d --build api
 ```
 
-✅ **Result:** LLM provider swapped without rewriting a single line of
+ **Result:** LLM provider swapped without rewriting a single line of
 business logic.  The `BookService`, `ReviewService`, `BackgroundTasks`,
 `PreferenceService`, and `RecommendationService` are completely decoupled
 from the concrete LLM implementation.
