@@ -1,0 +1,104 @@
+services:
+  api:
+    build: .
+    ports:
+      - "5223:5223"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://lumina:lumina@db:5432/luminalib
+      - STORAGE_BACKEND=local
+      - STORAGE_PATH=./storage
+      - LLM_PROVIDER=llama
+      - LLM_BASE_URL=http://ollama:11434
+      - LLM_MODEL=llama3.2:1b
+      - REDIS_URL=redis://redis:6379
+      # S3 / MinIO — activate by changing STORAGE_BACKEND=s3
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_BUCKET=luminalib-books
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    restart: on-failure
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=lumina
+      - POSTGRES_PASSWORD=lumina
+      - POSTGRES_DB=luminalib
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumina -d luminalib"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------- S3-compatible object store (MinIO) ----------
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9002:9001"   # MinIO web console (9001 taken by another project)
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------- Local LLM inference (Ollama) ----------
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"    # Ollama REST API
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: on-failure
+    # Uncomment 'deploy' below if you have a GPU available:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  postgres_data:
+  minio_data:
+  ollama_data:
