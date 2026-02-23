@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 from uuid import UUID
 
-from app.domain.entities import Book, BorrowRecord, Review, User, UserInteraction, UserPreference, UserTasteProfile
+from app.domain.entities import Book, BookAnalysis, BorrowRecord, Review, User, UserInteraction, UserPreference, UserTasteProfile
 
 
 class IUserRepository(ABC):
@@ -169,6 +169,14 @@ class IUserTasteProfileRepository(ABC):
         pass
 
 
+class IBookAnalysisRepository(ABC):
+
+    @abstractmethod
+    async def get_by_book_id(self, book_id: UUID) -> Optional[BookAnalysis]:
+        """Return the cached analysis for a book, or None if not yet generated."""
+        pass
+
+
 class IStorageService(ABC):
 
     @abstractmethod
@@ -202,6 +210,26 @@ class ILLMService(ABC):
     @abstractmethod
     async def analyze_sentiment(self, text: str) -> str:
         """Analyze sentiment of a review text."""
+        pass
+
+    @abstractmethod
+    async def generate_taste_cluster_label(
+        self,
+        top_authors: list[str],
+        top_genres: list[str],
+        avg_rating: float,
+        total_borrows: int,
+    ) -> str:
+        """Generate a short reader persona label from a user's taste data."""
+        pass
+
+    @abstractmethod
+    async def extract_book_metadata(self, text: str) -> dict[str, str]:
+        """Extract title, author, and genre from book text content.
+
+        Returns a dict with keys ``'title'``, ``'author'``, ``'genre'``.
+        Any value may be an empty string if it could not be reliably extracted.
+        """
         pass
 
 

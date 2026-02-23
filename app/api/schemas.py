@@ -251,3 +251,17 @@ class PreferenceSnapshotResponse(BaseModel):
     explicit: dict
     implicit: dict
     computed: dict
+
+
+# ---------------------------------------------------------------------------
+# Task status
+# ---------------------------------------------------------------------------
+
+
+class TaskStatusResponse(BaseModel):
+    """Current state of a background Celery task."""
+
+    task_id: str
+    status: str  # PENDING | STARTED | SUCCESS | FAILURE | RETRY
+    result: Optional[dict] = None
+    error: Optional[str] = None

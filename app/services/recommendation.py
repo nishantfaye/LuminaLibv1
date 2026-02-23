@@ -18,7 +18,6 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 from uuid import UUID
 
 import numpy as np

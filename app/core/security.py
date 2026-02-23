@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 from typing import Optional
+from uuid import uuid4
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -24,12 +25,16 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create a JWT access token."""
+    """Create a JWT access token.
+
+    Each token includes a unique ``jti`` (JWT ID) claim so it can be
+    individually revoked in the Redis blacklist on signout.
+    """
     to_encode = data.copy()
     expire = datetime.utcnow() + (
         expires_delta or timedelta(minutes=settings.access_token_expire_minutes)
     )
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "jti": str(uuid4())})
     return jwt.encode(to_encode, settings.secret_key, algorithm=ALGORITHM)
 
 

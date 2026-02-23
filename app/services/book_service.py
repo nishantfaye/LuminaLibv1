@@ -8,11 +8,12 @@ from uuid import UUID, uuid4
 
 from app.domain.entities import Book
 from app.domain.repositories import IBookRepository, ILLMService, IStorageService
+from app.domain.services import IBookService
 
 logger = logging.getLogger(__name__)
 
 
-class BookService:
+class BookService(IBookService):
     """Book service handling business logic."""
 
     def __init__(
@@ -27,30 +28,67 @@ class BookService:
 
     async def create_book(
         self,
-        title: str,
-        author: str,
         file_content: bytes,
         filename: str,
         mime_type: str,
-        genre: str = "general",
+        title: Optional[str] = None,
+        author: Optional[str] = None,
+        genre: Optional[str] = None,
     ) -> Book:
-        """Create a new book with file upload.
+        """Ingest a book — content-first.
+
+        Metadata (title, author, genre) is resolved in priority order:
+
+        1. Caller-supplied values — explicit user input always wins.
+        2. Embedded PDF header fields (title / author / subject).
+        3. LLM extraction from the opening text of the file.
+        4. Fallback: filename stem as title, ``"Unknown Author"``, ``"general"``.
 
         The book record is persisted immediately.  Summary & embedding
-        generation is handled by a **background task** dispatched from the
-        API layer (see ``app.services.background_tasks``).
+        generation is handled by a **Celery background task** dispatched from
+        the API layer.
         """
-        logger.info(f"Creating book: {title} by {author}, genre: {genre}, file: {filename}")
+        # ── 1. Extract text from the file (content is the primary artifact) ──
+        text_content = self._extract_text(file_content, mime_type)
+
+        # ── 2. PDF built-in metadata (fast, no network call needed) ──────────
+        pdf_meta: dict[str, str] = {}
+        if mime_type == "application/pdf":
+            pdf_meta = self._extract_pdf_metadata(file_content)
+            if any(pdf_meta.values()):
+                logger.info("PDF header metadata found: %s", pdf_meta)
+
+        # ── 3. LLM extraction — only called when metadata is still missing ────
+        llm_meta: dict[str, str] = {}
+        if not title or not author:
+            try:
+                llm_meta = await self.llm_service.extract_book_metadata(text_content[:3000])
+                logger.info("LLM extracted metadata: %s", llm_meta)
+            except Exception as exc:
+                logger.warning("LLM metadata extraction failed: %s", exc)
+
+        # ── 4. Priority resolution: caller > PDF header > LLM > fallback ─────
+        filename_stem = filename.rsplit(".", 1)[0].replace("_", " ").replace("-", " ").title()
+        resolved_title = title or pdf_meta.get("title") or llm_meta.get("title") or filename_stem
+        resolved_author = (
+            author or pdf_meta.get("author") or llm_meta.get("author") or "Unknown Author"
+        )
+        resolved_genre = genre or llm_meta.get("genre") or "general"
+
+        logger.info(
+            "Creating book: '%s' by '%s' [%s], file: %s",
+            resolved_title, resolved_author, resolved_genre, filename,
+        )
 
         content_hash = hashlib.sha256(file_content).hexdigest()
         file_path = await self.storage_service.save_file(file_content, filename)
-        logger.info(f"File saved: {file_path}")
+        logger.info("File saved: %s", file_path)
 
         book = Book(
             id=uuid4(),
-            title=title,
-            author=author,
-            genre=genre,
+            title=resolved_title,
+            author=resolved_author,
+            genre=resolved_genre,
             file_path=file_path,
             file_size=len(file_content),
             mime_type=mime_type,
@@ -61,7 +99,7 @@ class BookService:
             updated_at=datetime.utcnow(),
         )
         created_book = await self.book_repository.create(book)
-        logger.info(f"Book record created: {created_book.id}")
+        logger.info("Book record created: %s", created_book.id)
         return created_book
 
     async def get_book(self, book_id: UUID) -> Optional[Book]:
@@ -171,3 +209,29 @@ class BookService:
             return file_content.decode("utf-8", errors="ignore")
         # Fallback: try UTF-8 decode for unknown types
         return file_content.decode("utf-8", errors="ignore")[:5000]
+
+    @staticmethod
+    def _extract_pdf_metadata(file_content: bytes) -> dict[str, str]:
+        """Read title, author, and subject from the PDF document properties.
+
+        Returns a dict with keys ``'title'``, ``'author'``, ``'genre'``
+        (mapped from the PDF ``subject`` field).  Any absent field is an
+        empty string.  Returns an empty dict when PyMuPDF is unavailable.
+        """
+        try:
+            import fitz  # PyMuPDF
+
+            doc = fitz.open(stream=file_content, filetype="pdf")
+            meta = doc.metadata or {}
+            doc.close()
+            return {
+                "title": (meta.get("title") or "").strip(),
+                "author": (meta.get("author") or "").strip(),
+                # PDF "subject" is the closest standard field to "genre"
+                "genre": (meta.get("subject") or "").strip(),
+            }
+        except ImportError:
+            return {}
+        except Exception as exc:
+            logger.warning("PDF metadata extraction failed: %s", exc)
+            return {}

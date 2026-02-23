@@ -10,6 +10,7 @@ from app.api.auth_routes import router as auth_router
 from app.api.preference_routes import router as preference_router
 from app.api.recommendation_routes import router as recommendation_router
 from app.api.routes import router as books_router
+from app.api.task_routes import router as task_router
 from app.infrastructure.database.connection import init_db
 
 # Configure logging
@@ -49,6 +50,7 @@ app.include_router(auth_router)
 app.include_router(books_router)
 app.include_router(recommendation_router)
 app.include_router(preference_router)
+app.include_router(task_router)
 
 
 @app.get("/health")

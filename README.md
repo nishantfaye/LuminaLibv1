@@ -110,9 +110,10 @@ code changes.
 ### Production-Ready
 - **Fully async** — `async/await` everywhere, from HTTP handlers to DB
   queries (`asyncpg`) to LLM calls (`httpx`).
-- **Background tasks** — heavy LLM work runs after the HTTP response is sent
-  (FastAPI `BackgroundTasks`), keeping response times fast.
-- **Docker Compose** — one command spins up 5 health-checked containers.
+- **Background tasks** — heavy LLM work runs in a dedicated **Celery + Redis**
+  worker, completely isolated from the API process, with retry and task-state
+  tracking (`GET /tasks/{task_id}`).
+- **Docker Compose** — one command spins up 7 health-checked containers.
 - **Auto-generated API docs** — Swagger UI + ReDoc available instantly.
 - **10 unit tests** — pytest + pytest-asyncio with `AsyncMock` for every
   infrastructure dependency.
@@ -145,7 +146,7 @@ That's it. Docker will:
 1. Build the Python 3.11 API image from the `Dockerfile`.
 2. Pull `postgres:15-alpine`, `redis:7-alpine`, `minio/minio:latest`, and
    `ollama/ollama:latest`.
-3. Start all 5 containers with healthchecks.
+3. Start all 7 containers with healthchecks.
 4. Automatically create the database tables on first boot.
 5. Begin serving the API on **http://localhost:5223**.
 
@@ -209,38 +210,40 @@ docker compose down -v --remove-orphans
 
 ## What Gets Started
 
-`docker compose up` launches **5 containers** that form the complete stack:
+`docker compose up` launches **7 containers** that form the complete stack:
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                       Docker Compose Stack                           │
-│                                                                       │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                  │
-│  │   api        │  │   db         │  │   redis      │                 │
-│  │  FastAPI     │  │  PostgreSQL  │  │  Redis 7     │                 │
-│  │  :5223       │  │  :5433→5432  │  │  :6380→6379  │                 │
-│  │  Python 3.11 │  │  15-alpine   │  │  alpine      │                 │
-│  └──────┬───────┘  └──────────────┘  └──────────────┘                │
-│         │                                                             │
-│  ┌──────┴──────────────────────────────────────────┐                 │
-│  │                                                  │                 │
-│  ▼                         ▼                        │                 │
-│  ┌─────────────┐  ┌─────────────┐                   │                 │
-│  │   minio      │  │   ollama     │                  │                 │
-│  │  S3 Storage  │  │  Local LLM   │                  │                 │
-│  │  :9000 API   │  │  :11434      │                  │                 │
-│  │  :9002 UI    │  │  Llama 3     │                  │                 │
-│  └──────────────┘  └──────────────┘                  │                 │
-└───────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Docker Compose Stack                               │
+│                                                                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐                   │
+│  │   api        │  │   db         │  │   redis           │                  │
+│  │  FastAPI     │  │  PostgreSQL  │  │  Redis 7          │                  │
+│  │  :5223       │  │  :5433→5432  │  │  :6380→6379       │                  │
+│  │  Python 3.11 │  │  15-alpine   │  │  Celery broker    │                  │
+│  └──────┬───────┘  └──────────────┘  └──────────────────┘                  │
+│         │                                                                   │
+│  ┌──────┴─────────────────────────────────────────────────┐                │
+│  │                                                         │                │
+│  ▼               ▼               ▼              ▼          │                │
+│  ┌─────────────┐ ┌─────────────┐ ┌───────────┐ ┌────────┐ │                │
+│  │   minio      │ │   ollama     │ │  worker   │ │ollama  │ │                │
+│  │  S3 Storage  │ │  Local LLM   │ │  Celery   │ │ -init  │ │                │
+│  │  :9000 API   │ │  :11434      │ │  worker   │ │ pulls  │ │                │
+│  │  :9002 UI    │ │  llama3.2:1b │ │  process  │ │ model  │ │                │
+│  └─────────────┘ └─────────────┘ └───────────┘ └────────┘ │                │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-| Service      | Image                 | Host Port   | Purpose                                | Healthcheck               |
-|--------------|-----------------------|-------------|----------------------------------------|---------------------------|
-| **api**      | `python:3.11-slim`    | **5223**    | FastAPI application server             | `GET /health`             |
-| **db**       | `postgres:15-alpine`  | **5433**    | PostgreSQL relational database         | `pg_isready`              |
-| **redis**    | `redis:7-alpine`      | **6380**    | Cache / future Celery broker           | `redis-cli ping`          |
-| **minio**    | `minio/minio:latest`  | **9000 / 9002** | S3-compatible object storage       | `mc ready local`          |
-| **ollama**   | `ollama/ollama:latest`| **11434**   | Local LLM inference (Llama 3)          | `curl /api/tags`          |
+| Service          | Image                  | Host Port       | Purpose                                    | Healthcheck          |
+|------------------|------------------------|-----------------|--------------------------------------------|----------------------|
+| **api**          | `python:3.11-slim`     | **5223**        | FastAPI application server                 | `GET /health`        |
+| **db**           | `postgres:15-alpine`   | **5433**        | PostgreSQL relational database             | `pg_isready`         |
+| **redis**        | `redis:7-alpine`       | **6380**        | Celery broker + JWT revocation store       | `redis-cli ping`     |
+| **minio**        | `minio/minio:latest`   | **9000 / 9002** | S3-compatible object storage               | `mc ready local`     |
+| **ollama**       | `ollama/ollama:latest` | **11434**       | Local LLM inference (llama3.2:1b)          | `ollama list`        |
+| **worker**       | `python:3.11-slim`     | —               | Celery worker for LLM background tasks     | —                    |
+| **ollama-init**  | `ollama/ollama:latest` | —               | One-shot: pulls llama3.2:1b on first boot  | —                    |
 
 > Host ports are intentionally **non-standard** (5223, 5433, 6380) to avoid
 > conflicts with any locally-running PostgreSQL, Redis, or other services.
@@ -414,7 +417,7 @@ everything — you only need to touch these if customising.
 | `S3_SECRET_KEY`               | *(empty)*                                                     | S3 / MinIO secret key                   |
 | `LLM_PROVIDER`                | `mock`                                                        | `mock`, `llama`, or `openai`            |
 | `LLM_BASE_URL`                | `http://localhost:11434`                                      | Ollama server URL                       |
-| `LLM_MODEL`                   | `llama3`                                                      | Model tag for Ollama                    |
+| `LLM_MODEL`                   | `llama3.2:1b`                                                 | Model tag for Ollama                    |
 | `LLM_API_KEY`                 | *(empty)*                                                     | API key for OpenAI provider             |
 | `REDIS_URL`                   | `redis://localhost:6379`                                      | Redis connection URL                    |
 | `SECRET_KEY`                  | `dev-secret-key`                                              | JWT signing secret (**change in prod**) |
@@ -655,23 +658,23 @@ All swap tests pass with **zero code changes** between configurations:
 
 ```
 ======================================================================
- COMPONENT SWAP VERIFICATION — 11/11 passed
+COMPONENT SWAP VERIFICATION — 11/11 passed
 ======================================================================
   STORAGE_BACKEND=s3     → Book uploaded to MinIO S3 bucket
   LLM_PROVIDER=mock      → MockLLM summary detected (instant)
   LLM_PROVIDER=openai    → Graceful fallback to mock (no API key)
   Original config restored → API healthy, upload succeeded
 ======================================================================
-  Storage local→s3 :  1 config line change  
-  LLM llama→mock   :  1 config line change  
-  LLM llama→openai :  2 config lines         (provider + API key)
+  Storage local→s3 :  1 config line change   PASS
+  LLM llama→mock   :  1 config line change   PASS
+  LLM llama→openai :  2 config lines         PASS  (provider + API key)
   Business logic changes required: ZERO
 ======================================================================
 ```
 
 ---
 
-###  Try It Yourself — Step-by-Step Swap Tutorials
+### Try It Yourself — Step-by-Step Swap Tutorials
 
 The following two tutorials let you **reproduce** the swaps on your own
 running stack.  Each tutorial is fully self-contained: open a terminal,
@@ -784,7 +787,7 @@ docker compose up -d --build api
 **What files were modified?**  Only `docker-compose.yml` (one value).
 No `.py` file was opened, edited, or redeployed.
 
- **Result:** Storage backend swapped with a single config line.
+**Result:** Storage backend swapped with a single config line.
 
 ---
 
@@ -926,7 +929,7 @@ sed -i '' 's/LLM_PROVIDER=openai/LLM_PROVIDER=llama/' docker-compose.yml
 docker compose up -d --build api
 ```
 
- **Result:** LLM provider swapped without rewriting a single line of
+**Result:** LLM provider swapped without rewriting a single line of
 business logic.  The `BookService`, `ReviewService`, `BackgroundTasks`,
 `PreferenceService`, and `RecommendationService` are completely decoupled
 from the concrete LLM implementation.
@@ -943,11 +946,13 @@ app/
 │   ├── auth_routes.py              #   signup, login, profile, signout
 │   ├── routes.py                   #   books CRUD, borrow, reviews, analysis
 │   ├── recommendation_routes.py    #   /recommendations (user-level)
+│   ├── preference_routes.py        #   user taste-preference endpoints
 │   └── schemas.py                  #   Pydantic v2 request / response models
 │
 ├── core/                           # ── Cross-Cutting Concerns ──
 │   ├── config.py                   #   pydantic-settings (.env loading)
 │   ├── security.py                 #   JWT creation / validation + bcrypt
+│   ├── redis_client.py             #   shared Redis client (JWT blacklist + Celery)
 │   └── dependencies.py             #   FastAPI DI container (Composition Root)
 │
 ├── domain/                         # ── Domain Layer (zero external deps) ──
@@ -956,27 +961,31 @@ app/
 │
 ├── infrastructure/                 # ── Infrastructure Layer (adapters) ──
 │   ├── database/
-│   │   ├── connection.py           #   async engine + session factory
+│   │   ├── connection.py           #   async engine + session factory (+ NullPool worker engine)
 │   │   ├── models.py              #   6 SQLAlchemy 2.x ORM models
 │   │   └── repository.py          #   5 concrete repository implementations
 │   ├── llm/
 │   │   ├── prompts.py             #   PromptTemplate + versioned registry
 │   │   └── services.py            #   MockLLM / LlamaLLM / OpenAILLM
-│   └── storage/
-│       ├── local.py               #   LocalStorageService (SHA-256 dirs)
-│       └── s3.py                  #   S3StorageService (AWS / MinIO via boto3)
+│   ├── storage/
+│   │   ├── local.py               #   LocalStorageService (SHA-256 dirs)
+│   │   └── s3.py                  #   S3StorageService (AWS / MinIO via boto3)
+│   └── tasks/
+│       ├── celery_app.py          #   Celery application instance + config
+│       └── llm_tasks.py           #   Celery task wrappers (generate_book_summary, etc.)
 │
 └── services/                       # ── Application / Use-Case Layer ──
     ├── auth_service.py             #   signup, login, profile management
     ├── book_service.py             #   book CRUD + file ingestion pipeline
     ├── review_service.py           #   reviews + GenAI consensus
-    ├── background_tasks.py         #   async summary & sentiment workers
+    ├── background_tasks.py         #   async coroutines executed by Celery workers
+    ├── preference_service.py       #   user taste-profile management
     └── recommendation.py           #   ML cosine-similarity engine
 
 tests/
     └── test_book_service.py        # 10 unit tests (pytest + AsyncMock)
 
-docker-compose.yml                  # 5-service stack with healthchecks
+docker-compose.yml                  # 7-service stack with healthchecks
 Dockerfile                          # python:3.11-slim, port 5223
 start.sh                            # Helper script to launch everything
 requirements.txt                    # Production dependencies
@@ -1035,8 +1044,9 @@ make lint     # mypy + flake8
 | **LLM / GenAI**  | Ollama (Llama 3) · OpenAI · httpx                 |
 | **ML**           | NumPy · scikit-learn (cosine similarity)           |
 | **Storage**      | Local filesystem · MinIO (S3-compatible) · boto3   |
-| **Containers**   | Docker Compose — 5 services with healthchecks      |
-| **Cache**        | Redis 7 (Celery-ready)                             |
+| **Task queue**   | Celery 5 · Redis broker · task-state result backend |
+| **Containers**   | Docker Compose — 7 services with healthchecks      |
+| **Cache/Broker** | Redis 7 — Celery broker + JWT revocation store     |
 | **PDF**          | PyMuPDF (fitz)                                     |
 | **Testing**      | pytest · pytest-asyncio · AsyncMock                |
 | **Formatting**   | black · isort · flake8 · mypy                      |
@@ -1051,7 +1061,7 @@ diagrams, SOLID principle mapping, and trade-off analysis, see:
 **[ARCHITECTURE.md](ARCHITECTURE.md)**
 
 Contents include:
-- System architecture overview diagram (all 5 services)
+- System architecture overview diagram (all 7 services)
 - Clean Architecture layers diagram with class mapping
 - Book upload pipeline (sequence diagram)
 - Review submission & consensus pipeline
@@ -1064,5 +1074,6 @@ Contents include:
 ---
 
 ## License
+ — educational assessment project.
 
-Private — educational assessment project.
+# LuminaLib-v1

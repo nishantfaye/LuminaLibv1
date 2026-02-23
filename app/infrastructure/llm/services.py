@@ -13,9 +13,11 @@ import numpy as np
 
 from app.domain.repositories import ILLMService
 from app.infrastructure.llm.prompts import (
+    BOOK_METADATA_PROMPT,
     BOOK_SUMMARY_PROMPT,
     REVIEW_CONSENSUS_PROMPT,
     SENTIMENT_ANALYSIS_PROMPT,
+    TASTE_CLUSTER_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +98,41 @@ class MockLLMService(ILLMService):
         elif neg > pos:
             return "negative"
         return "neutral"
+
+    async def generate_taste_cluster_label(
+        self,
+        top_authors: list[str],
+        top_genres: list[str],
+        avg_rating: float,
+        total_borrows: int,
+    ) -> str:
+        """Mock taste cluster label based on top genre or author."""
+        prompt = TASTE_CLUSTER_PROMPT.render_flat(
+            top_authors=", ".join(top_authors) or "unknown",
+            top_genres=", ".join(top_genres) or "unknown",
+            avg_rating=f"{avg_rating:.1f}",
+            total_borrows=total_borrows,
+        )
+        logger.debug("MockLLM taste cluster prompt (%d chars)", len(prompt))
+        if top_genres:
+            return f"{top_genres[0].title()} Reader"
+        if top_authors:
+            return f"Fan of {top_authors[0]}"
+        return "Eclectic Reader"
+
+    async def extract_book_metadata(self, text: str) -> dict[str, str]:
+        """Heuristic metadata extraction for offline dev/testing."""
+        import re
+
+        prompt = BOOK_METADATA_PROMPT.render_flat(text=text[:500])
+        logger.debug("MockLLM metadata extraction prompt (%d chars)", len(prompt))
+
+        # Simple pattern: look for "by <Firstname Lastname>" near the top
+        author = ""
+        match = re.search(r"\bby\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)", text[:500])
+        if match:
+            author = match.group(1)
+        return {"title": "", "author": author, "genre": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +247,44 @@ class LlamaLLMService(ILLMService):
         logger.warning("Ollama sentiment response not parseable: %r; falling back", result)
         return await self._mock.analyze_sentiment(text)
 
+    async def generate_taste_cluster_label(
+        self,
+        top_authors: list[str],
+        top_genres: list[str],
+        avg_rating: float,
+        total_borrows: int,
+    ) -> str:
+        """Generate a reader persona label via Ollama."""
+        messages = TASTE_CLUSTER_PROMPT.render(
+            top_authors=", ".join(top_authors) or "unknown",
+            top_genres=", ".join(top_genres) or "unknown",
+            avg_rating=f"{avg_rating:.1f}",
+            total_borrows=total_borrows,
+        )
+        logger.info("LlamaLLM: requesting taste cluster from %s", self.base_url)
+        result = await self._chat(messages)
+        return result.strip().strip('"\'')[:100] or await self._mock.generate_taste_cluster_label(
+            top_authors, top_genres, avg_rating, total_borrows
+        )
+
+    async def extract_book_metadata(self, text: str) -> dict[str, str]:
+        """Extract book title, author, and genre from content via Ollama."""
+        import json
+
+        messages = BOOK_METADATA_PROMPT.render(text=text[:3000])
+        logger.info("LlamaLLM: extracting book metadata from %s", self.base_url)
+        raw = await self._chat(messages)
+        try:
+            data = json.loads(raw.strip())
+            return {
+                "title": str(data.get("title", "")).strip(),
+                "author": str(data.get("author", "")).strip(),
+                "genre": str(data.get("genre", "")).strip(),
+            }
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning("LlamaLLM: metadata JSON parse failed; falling back to mock")
+            return await self._mock.extract_book_metadata(text)
+
 
 # ---------------------------------------------------------------------------
 # OpenAI (remote API)
@@ -273,3 +348,39 @@ class OpenAILLMService(ILLMService):
         if cleaned in {"positive", "negative", "neutral"}:
             return cleaned
         return await self._mock.analyze_sentiment(text)
+
+    async def generate_taste_cluster_label(
+        self,
+        top_authors: list[str],
+        top_genres: list[str],
+        avg_rating: float,
+        total_borrows: int,
+    ) -> str:
+        """Generate a reader persona label via OpenAI."""
+        messages = TASTE_CLUSTER_PROMPT.render(
+            top_authors=", ".join(top_authors) or "unknown",
+            top_genres=", ".join(top_genres) or "unknown",
+            avg_rating=f"{avg_rating:.1f}",
+            total_borrows=total_borrows,
+        )
+        result = await self._chat(messages)
+        return result.strip().strip('"\'')[:100] or await self._mock.generate_taste_cluster_label(
+            top_authors, top_genres, avg_rating, total_borrows
+        )
+
+    async def extract_book_metadata(self, text: str) -> dict[str, str]:
+        """Extract book title, author, and genre from content via OpenAI."""
+        import json
+
+        messages = BOOK_METADATA_PROMPT.render(text=text[:3000])
+        raw = await self._chat(messages)
+        try:
+            data = json.loads(raw.strip())
+            return {
+                "title": str(data.get("title", "")).strip(),
+                "author": str(data.get("author", "")).strip(),
+                "genre": str(data.get("genre", "")).strip(),
+            }
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning("OpenAI: metadata JSON parse failed; falling back to mock")
+            return await self._mock.extract_book_metadata(text)

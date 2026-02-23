@@ -1,4 +1,23 @@
+# =============================================================================
+# LuminaLib — Docker Compose
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  SINGLE COMMAND — spins up the full stack including Ollama LLM          │
+# │                                                                         │
+# │    docker compose up -d --build                                         │
+# │                                                                         │
+# │  Starts: api · worker · db · redis · minio · ollama · ollama-init       │
+# │  ollama-init pulls llama3.2:1b on first boot (cached in volume).        │
+# │                                                                         │
+# │  AUTO-FALLBACK: if the pull fails or Ollama is incompatible,            │
+# │  LlamaLLMService automatically falls back to MockLLMService —           │
+# │  the stack never goes down, no code changes needed.                     │
+# └─────────────────────────────────────────────────────────────────────────┘
+# =============================================================================
+
 services:
+
+  # ---------- API service ----------
   api:
     build: .
     ports:
@@ -9,7 +28,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://lumina:lumina@db:5432/luminalib
       - STORAGE_BACKEND=local
       - STORAGE_PATH=./storage
-      - LLM_PROVIDER=llama
+      - LLM_PROVIDER=${LLM_PROVIDER:-mock}   # "mock" | "llama" | "openai"
       - LLM_BASE_URL=http://ollama:11434
       - LLM_MODEL=llama3.2:1b
       - REDIS_URL=redis://redis:6379
@@ -24,13 +43,47 @@ services:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
       minio:
         condition: service_healthy
-      ollama:
-        condition: service_started
+      ollama-init:
+        condition: service_completed_successfully
+        required: false   # soft dep — api/worker start even if pull fails
     restart: on-failure
 
+  # ---------- Celery worker (LLM background tasks) ----------
+  worker:
+    build: .
+    command: celery -A app.infrastructure.tasks.celery_app.celery_app worker --loglevel=info --concurrency=2
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://lumina:lumina@db:5432/luminalib
+      - STORAGE_BACKEND=local
+      - STORAGE_PATH=./storage
+      - LLM_PROVIDER=${LLM_PROVIDER:-mock}   # "mock" | "llama" | "openai"
+      - LLM_BASE_URL=http://ollama:11434
+      - LLM_MODEL=llama3.2:1b
+      - REDIS_URL=redis://redis:6379
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_BUCKET=luminalib-books
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+        required: false   # soft dep — api/worker start even if pull fails
+    restart: on-failure
+
+  # ---------- PostgreSQL ----------
   db:
     image: postgres:15-alpine
     environment:
@@ -47,6 +100,7 @@ services:
       timeout: 5s
       retries: 10
 
+  # ---------- Redis (Celery broker + JWT revocation store) ----------
   redis:
     image: redis:7-alpine
     ports:
@@ -57,7 +111,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # ---------- S3-compatible object store (MinIO) ----------
+  # ---------- MinIO (S3-compatible object store) ----------
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -75,21 +129,23 @@ services:
       timeout: 5s
       retries: 10
 
-  # ---------- Local LLM inference (Ollama) ----------
+  # ---------- Ollama LLM server ----------
+  # Started automatically with docker compose up.
+  # Exposes the Ollama REST API; ollama-init pulls the model on first boot.
   ollama:
     image: ollama/ollama:latest
     ports:
-      - "11434:11434"    # Ollama REST API
+      - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      test: ["CMD-SHELL", "ollama list || exit 1"]
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 12
       start_period: 30s
     restart: on-failure
-    # Uncomment 'deploy' below if you have a GPU available:
+    # Uncomment to enable GPU pass-through (NVIDIA):
     # deploy:
     #   resources:
     #     reservations:
@@ -97,6 +153,22 @@ services:
     #         - driver: nvidia
     #           count: all
     #           capabilities: [gpu]
+
+  # ---------- Model bootstrap ----------
+  # One-shot: waits for Ollama to be healthy, then pulls llama3.2:1b.
+  # Model is stored in the shared ollama_data volume (downloaded only once).
+  # Uses `|| echo` so a failed pull exits 0; the app auto-falls back to mock.
+  ollama-init:
+    image: ollama/ollama:latest
+    entrypoint: >
+      sh -c "ollama pull llama3.2:1b ||
+             echo '[ollama-init] pull failed — app will auto-fall back to MockLLMService'"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: no
 
 volumes:
   postgres_data:

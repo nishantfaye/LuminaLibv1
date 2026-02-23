@@ -18,3 +18,5 @@ bcrypt==4.0.1
 greenlet==3.0.3
 PyMuPDF==1.23.8
 boto3==1.34.14
+celery[redis]==5.3.6
+redis>=4.6.0

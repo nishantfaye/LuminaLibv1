@@ -7,8 +7,9 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.entities import Book, BorrowRecord, Review, User, UserInteraction, UserPreference, UserTasteProfile
+from app.domain.entities import Book, BookAnalysis, BorrowRecord, Review, User, UserInteraction, UserPreference, UserTasteProfile
 from app.domain.repositories import (
+    IBookAnalysisRepository,
     IBookRepository,
     IBorrowRepository,
     IReviewRepository,
@@ -542,4 +543,30 @@ class UserTasteProfileRepository(IUserTasteProfileRepository):
             taste_cluster=model.taste_cluster,
             confidence_score=model.confidence_score,
             last_computed_at=model.last_computed_at,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Book Analysis Repository
+# ---------------------------------------------------------------------------
+class BookAnalysisRepository(IBookAnalysisRepository):
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get_by_book_id(self, book_id: UUID) -> Optional[BookAnalysis]:
+        result = await self.session.execute(
+            select(BookAnalysisModel).where(BookAnalysisModel.book_id == book_id)
+        )
+        model = result.scalar_one_or_none()
+        return self._to_entity(model) if model else None
+
+    @staticmethod
+    def _to_entity(model: BookAnalysisModel) -> BookAnalysis:
+        return BookAnalysis(
+            book_id=model.book_id,
+            review_count=model.review_count,
+            average_rating=model.average_rating,
+            consensus_summary=model.consensus_summary,
+            updated_at=model.updated_at,
         )

@@ -51,7 +51,7 @@ The diagram below shows every runtime component and how they communicate:
  |  |   |            Service Layer                                |           |
  |  |   |  AuthService . BookService . ReviewService              |           |
  |  |   |  MLRecommendationService . PreferenceService            |           |
- |  |   |  BackgroundTasks                                        |           |
+ |  |   |  Celery Tasks  (enqueued to worker via Redis)           |           |
  |  |   +--------------------+------------------------------------+           |
  |  |                        | uses abstract interfaces                       |
  |  |                        v                                                |
@@ -79,7 +79,8 @@ The diagram below shows every runtime component and how they communicate:
 - Ollama provides local LLM inference (summaries, embeddings, sentiment,
   consensus, taste-cluster labels).
 - MinIO serves as S3-compatible object storage for uploaded book files.
-- Redis is provisioned as a cache / future Celery broker.
+- Redis is the **Celery broker and result backend** (task queue between `api` and
+  `worker`) and the **JWT token revocation store** (blacklist for signed-out tokens).
 
 ---
 
@@ -100,7 +101,7 @@ imports; the infrastructure layer depends on the domain, never the reverse.
 |           Application / Service Layer                         |
 |   BookService . AuthService . ReviewService                   |
 |   MLRecommendationService . PreferenceService                 |
-|   BackgroundTasks (summary, sentiment, consensus)             |
+|   Celery Worker Tasks (summary, sentiment, consensus)         |
 +--------------------+-----------------------------------------+
                      |  depends on
 +--------------------v-----------------------------------------+
@@ -292,19 +293,25 @@ this project's scope.
     |                  |                     |  INSERT book    |                    |
     |                  |                     |  (summary=null) |                    |
     |                  |                     |                 |                    |
-    |                  |                     |  enqueue background_task ---------->|
-    |                  |                     |                 |                    |
-    |  <-- 201 --------|  <-- Book ----------|                 |                    |
-    |  (summary=null)  |                     |                 |   generate_summary |
-    |                  |                     |                 |   generate_embedd. |
-    |                  |                     |                 |   UPDATE book      |
-    |                  |                     |                 |   SET summary,     |
-    |                  |                     |                 |       embedding    |
+    |                  |                     |  generate_book_summary.delay() ---->| Redis
+    |                  |                     |  (X-Task-ID header)     |           |  (broker)
+    |  <-- 201 --------|  <-- Book ----------|                 |       |           |
+    |  (summary=null,  |                     |                 |       |  Celery   |
+    |   X-Task-ID)     |                     |                 |       |  Worker   |
+    |                  |                     |                 |  <----|  consumes |
+    |                  |                     |                 |       |  task     |
+    |                  |                     |                 |   generate_summary|
+    |                  |                     |                 |   generate_embedd.|
+    |                  |                     |                 |   UPDATE book     |
+    |                  |                     |                 |   SET summary,    |
+    |                  |                     |                 |       embedding   |
 ```
 
 **Key design choice:** The HTTP response returns **immediately** (201) with
-`summary: null`.  The expensive LLM work runs asynchronously as a FastAPI
-`BackgroundTask`.  This keeps p99 latency low.
+`summary: null`.  The expensive LLM work is dispatched via `generate_book_summary.delay()`
+to a **Celery worker** running in a separate `worker` container.  The caller receives an
+`X-Task-ID` header and can poll `GET /tasks/{task_id}` to track completion.
+This keeps p99 latency low and ensures tasks survive API process restarts.
 
 ### 4.2 Review Submission & Consensus Pipeline
 
@@ -313,9 +320,9 @@ When a review is submitted via `POST /books/{id}/reviews`, the following happens
 1. **ReviewService.create_review()** validates the user has borrowed the book
    and has not already reviewed it, then INSERTs the review.
 2. The API layer dispatches **3 parallel actions**:
-   - `analyze_review_sentiment_task` (BackgroundTask) -- LLM classifies sentiment
-   - `update_rolling_consensus_task` (BackgroundTask) -- LLM generates consensus
-   - `record_interaction` (inline) -- records a Layer 2 implicit interaction
+   - `analyze_review_sentiment.delay(review_id, text)` — Celery task, LLM classifies sentiment; task ID returned in `X-Sentiment-Task-ID` header
+   - `update_rolling_consensus.delay(book_id)` — Celery task, LLM generates consensus; task ID returned in `X-Consensus-Task-ID` header
+   - `record_interaction` (inline) — records a Layer 2 implicit interaction
 
 **Key design choices:**
 - The rolling consensus is regenerated on every review submission --
@@ -758,72 +765,140 @@ and makes the system extensible as new interaction types emerge.
 
 ### Design Decision: No Refresh Tokens (Yet)
 
-For this assessment scope, we use a single access token with a 60-minute TTL.
-A production system would add:
-- Refresh token rotation (stored in Redis)
-- Token revocation list
+Tokens have a 60-minute TTL.  On `POST /auth/signout` the token's `jti` (JWT ID) is
+written to Redis with a TTL equal to the token's remaining lifetime — this is the
+**token revocation blacklist**.  Every authenticated request checks the blacklist
+before granting access, so signed-out tokens are immediately invalidated server-side.
+
+Further hardening that could be added:
+- Refresh token rotation (sliding sessions)
 - Role-based access control (RBAC)
 
 ---
 
 ## 10. Background Task Pipeline
 
-### Three Background Tasks
+LuminaLib uses **Celery + Redis** for all LLM-heavy background work.
+Tasks run in a dedicated `worker` container, completely isolated from the API process.
 
-LuminaLib dispatches **three distinct background tasks** on various user actions:
+### Architecture
 
-| Task | Triggered by | What it does | LLM calls |
-|---|---|---|---|
-| `generate_book_summary_task` | `POST /books/` (upload), `PUT /books/{id}/content` (re-upload) | Extracts text -> AI summary + embedding -> updates book | `generate_summary()` + `generate_embedding()` |
-| `analyze_review_sentiment_task` | `POST /books/{id}/reviews` | Classifies review sentiment (positive/neutral/negative) -> updates review | `analyze_sentiment()` |
-| `update_rolling_consensus_task` | `POST /books/{id}/reviews` | Reads all reviews -> generates consensus -> upserts to `book_analyses` | `generate_review_consensus()` |
-
-### Review Submission Dispatches 3 Parallel Actions
-
-When a review is submitted, the API layer dispatches:
-1. **Sentiment analysis** -- background task via `BackgroundTasks`
-2. **Rolling consensus update** -- background task via `BackgroundTasks`
-3. **Interaction recording** -- inline call to `PreferenceService.record_interaction()`
-   (Layer 2 implicit signal with weight 1.5)
-
-### Why FastAPI BackgroundTasks?
-
-| Option              | Pros                                    | Cons                                  | Chosen? |
-|---------------------|-----------------------------------------|---------------------------------------|:---:|
-| **BackgroundTasks** | Zero infra, in-process, simple          | Lost on crash, no retry, no queue     | Yes |
-| Celery + Redis      | Retry, monitoring, distributed workers  | Extra container, broker, result backend| No |
-| asyncio.create_task | Lighter than BG tasks                   | Unstructured, harder to track         | No |
-
-We chose `BackgroundTasks` because:
-1. The tasks are **fire-and-forget** (a missing summary is non-fatal)
-2. Redis is already provisioned -- Celery can be added later with zero API changes
-3. Each task opens **its own DB session** (`async_session_maker()`) to avoid
-   tying into the request's session lifecycle
-
-### Task Isolation
-
-Background tasks create independent database sessions:
-
-```python
-async def generate_book_summary_task(book_id, file_content, mime_type, llm_service):
-    async with async_session_maker() as session:
-        book_repo = BookRepository(session)
-        # ... generate summary, update book ...
+```
+  FastAPI (api)                Redis (broker)         Celery (worker)
+  ─────────────                ──────────────         ───────────────
+  task.delay(args)  ──push──►  task queue     ──pop──►  execute task
+                               result backend ◄─store── update book/review
+  GET /tasks/{id}  ◄──read───  result backend
 ```
 
-This prevents "session already closed" errors that would occur if the task
-tried to reuse the request-scoped session.
+The API **never waits** for LLM work to complete.  Every task ID is returned in a
+response header so the caller can poll `GET /tasks/{task_id}` for status.
+
+### Three Celery Tasks
+
+| Celery task name | Triggered by | What it does | LLM calls |
+|---|---|---|---|
+| `llm.generate_book_summary` | `POST /books/` (upload), `PUT /books/{id}/content` (re-upload) | Extracts text → AI summary + embedding → `UPDATE book` | `generate_summary()` + `generate_embedding()` |
+| `llm.analyze_review_sentiment` | `POST /books/{id}/reviews` | Classifies review sentiment → `UPDATE review.sentiment` | `analyze_sentiment()` |
+| `llm.update_rolling_consensus` | `POST /books/{id}/reviews` | Reads all reviews → generates consensus → upserts `book_analyses` | `generate_review_consensus()` |
+
+### Review Submission Dispatches 3 Actions
+
+When a review is submitted, the API layer dispatches:
+1. `analyze_review_sentiment.delay(review_id, text)` — Celery task; `X-Sentiment-Task-ID` header returned
+2. `update_rolling_consensus.delay(book_id)` — Celery task; `X-Consensus-Task-ID` header returned
+3. `record_interaction(...)` — inline call to `PreferenceService.record_interaction()`
+   (Layer 2 implicit signal)
+
+### Why Celery + Redis?
+
+| Option              | Pros                                      | Cons                                   | Chosen? |
+|---------------------|-------------------------------------------|----------------------------------------|:---:|
+| FastAPI BackgroundTasks | Zero infra, simple                  | Lost on crash, no retry, no state      | No  |
+| **Celery + Redis**  | Retry, task state, distributed workers, monitoring | Extra container, broker       | **Yes** |
+| asyncio.create_task | Lighter                                   | Unstructured, not durable              | No  |
+
+We chose Celery because:
+1. **Durability** — tasks survive API process restarts (`task_acks_late=True`,
+   `task_reject_on_worker_lost=True`)
+2. **Retry logic** — each task retries up to 3 times with 60-second back-off on failure
+3. **Observability** — `GET /tasks/{task_id}` exposes `PENDING → STARTED → SUCCESS / FAILURE`
+   state transitions backed by the Redis result backend
+4. **Isolation** — LLM calls (which can take 10–30 s) never block the API event loop
+
+### Task Implementation Pattern
+
+Each Celery task is a thin synchronous wrapper that calls an async coroutine via
+`asyncio.run()`, which is safe because each Celery worker process has its own event loop:
+
+```python
+@celery_app.task(bind=True, name="llm.generate_book_summary", max_retries=3,
+                 task_acks_late=True, task_reject_on_worker_lost=True)
+def generate_book_summary(self, book_id: str, mime_type: str) -> None:
+    try:
+        asyncio.run(generate_book_summary_task(book_id, mime_type))
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=60)
+```
+
+The async coroutine opens its own `AsyncSession` — independent of the request-scoped
+session — so there is no "session already closed" risk.
+
+### NullPool Engine for Celery Workers
+
+Each `asyncio.run()` call inside a Celery task creates a **new event loop** and
+destroys it when it exits.  asyncpg's default connection pool holds connections
+that are bound to the event loop that created them.  On the second task executed
+by the same worker process, the pool tries to reuse those connections — but they
+are attached to the now-closed loop, causing:
+
+```
+Task got Future <Future pending cb=[Protocol._on_waiter_completed()]>
+attached to a different loop
+```
+
+**Fix:** A dedicated `worker_engine` with `NullPool` is created in
+`app/infrastructure/database/connection.py`:
+
+```python
+from sqlalchemy.pool import NullPool
+
+# NullPool: opens a fresh DB connection per session, closes it immediately.
+# No connections are held between asyncio.run() calls → no loop-mismatch error.
+worker_engine = create_async_engine(
+    settings.database_url, echo=False, future=True, poolclass=NullPool
+)
+worker_session_maker = async_sessionmaker(
+    worker_engine, class_=AsyncSession, expire_on_commit=False
+)
+```
+
+`app/services/background_tasks.py` imports `worker_session_maker` (aliased as
+`async_session_maker`) so that every Celery task coroutine gets a clean
+connection regardless of which event loop is currently active.
+
+The FastAPI process continues to use the pooled `engine` / `async_session_maker`
+unaffected — only the worker-side code uses `NullPool`.
+
+### Task Status Endpoint
+
+```
+GET /tasks/{task_id}
+→ { "task_id": "...", "status": "SUCCESS", "result": null, "error": null }
+```
+
+States: `PENDING → STARTED → SUCCESS | FAILURE | RETRY`
 
 ### Cache-First Analysis Reads
 
 `ReviewService.get_book_analysis()` uses a **cache-first** strategy:
 
-1. Read from `book_analyses` table (populated by `update_rolling_consensus_task`)
-2. If cached result exists -> return it immediately (no LLM call)
-3. If no cached result -> fall back to on-demand LLM consensus generation
+1. Read from `book_analyses` table (populated by `llm.update_rolling_consensus`)
+2. If cached result exists → return immediately (zero LLM calls)
+3. If no cached result → fall back to on-demand LLM consensus generation
 
-This means the `GET /books/{id}/analysis` endpoint is fast for books that
-have had reviews submitted (the background task pre-populates the cache).
+This means `GET /books/{id}/analysis` is instant for books that have had reviews
+submitted, because the Celery task pre-populates the cache.
 
 ---
 
@@ -834,20 +909,43 @@ have had reviews submitted (the background task pre-populates the cache).
 | Service | Image | Internal Port | Host Port | Healthcheck |
 |---|---|---|---|---|
 | **api** | Built from Dockerfile | 5223 | 5223 | -- |
+| **worker** | Built from Dockerfile | -- | -- | -- (Celery worker process) |
 | **db** | postgres:15-alpine | 5432 | 5433 | `pg_isready -U lumina -d luminalib` |
 | **redis** | redis:7-alpine | 6379 | 6380 | `redis-cli ping` |
 | **minio** | minio/minio | 9000, 9001 | 9000, 9002 | `mc ready local` |
-| **ollama** | ollama/ollama | 11434 | 11434 | `curl -sf http://localhost:11434/api/tags` (start_period: 30s) |
+| **ollama** | ollama/ollama | 11434 | 11434 | `ollama list` (start_period: 30s) |
+| **ollama-init** | ollama/ollama | -- | -- | one-shot: pulls `llama3.2:1b` into shared volume, exits 0 |
 
-The API container uses `depends_on` with health conditions:
+Both `api` and `worker` gate on health conditions before starting:
 
 ```yaml
 depends_on:
-  db:       { condition: service_healthy }    # waits for pg_isready
-  redis:    { condition: service_started }
-  minio:    { condition: service_healthy }    # waits for mc ready
-  ollama:   { condition: service_started }
+  db:           { condition: service_healthy }                  # waits for pg_isready
+  redis:        { condition: service_healthy }                  # waits for redis-cli ping
+  minio:        { condition: service_healthy }                  # waits for mc ready local
+  ollama-init:
+    condition: service_completed_successfully
+    required: false   # soft dep — api/worker start even if pull fails
 ```
+
+`ollama-init` is a one-shot container: it waits for the `ollama` service healthcheck
+to pass, then runs `ollama pull llama3.2:1b` against `OLLAMA_HOST=http://ollama:11434`.
+The pulled model is stored in the shared `ollama_data` named volume so subsequent
+`docker compose up` runs skip the download.
+
+**Single-command startup — no flags needed:**
+
+```bash
+docker compose up -d --build   # starts everything: api, worker, db, redis, minio, ollama, ollama-init
+```
+
+**Auto-fallback chain (three layers):**
+1. `required: false` — `api`/`worker` start even if `ollama-init` never ran
+2. `|| echo` in `ollama-init` entrypoint — a failed model pull exits 0 and never blocks the stack
+3. `LlamaLLMService` code — every Ollama HTTP call is wrapped in `try/except`; any failure
+   returns `""` and the public method falls back to `self._mock.<method>()` automatically
+
+The stack **never goes down** due to an LLM failure.
 
 ### Design Decision: Separate Host Ports
 
@@ -857,9 +955,11 @@ services.  Internal container ports remain standard.
 
 ### Resilience
 
-- `restart: on-failure` on both `api` and `ollama` for automatic recovery
+- `restart: on-failure` on `api`, `worker`, and `ollama` for automatic recovery
+- Celery worker uses `task_acks_late=True` + `task_reject_on_worker_lost=True` —
+  tasks are re-queued if the worker crashes mid-execution
 - GPU-ready: commented-out `deploy.resources.reservations.devices` block for
-  NVIDIA GPU pass-through
+  NVIDIA GPU pass-through on the `ollama` service
 - Named volumes (`postgres_data`, `minio_data`, `ollama_data`) survive
   `docker compose down`; only wiped with `-v`
 
@@ -880,7 +980,7 @@ services.  Internal container ports remain standard.
 | `CollaborativeFilteringEngine` | Jaccard + item-item co-occurrence                         |
 | `PopularityEngine`           | Wilson score + time-decay + trending                         |
 | `KnowledgeGraphEngine`       | Author co-read graph + tag matching                          |
-| `background_tasks.py`        | Async LLM work (summary, sentiment, consensus)               |
+| `llm_tasks.py`               | Celery task wrappers — dispatch LLM work to worker process   |
 | `prompts.py`                 | Prompt template definition + versioning                      |
 | `dependencies.py`            | Object graph wiring (Composition Root)                       |
 
@@ -947,7 +1047,7 @@ IStorageService`.  It never imports `LocalStorageService`, `S3StorageService`,
 |----------------------------------------|--------------------------------|--------------------------------------------------------------------------------------------------------|
 | **FastAPI** over Django/Flask          | Django REST, Flask             | Native async, Pydantic-first validation, auto OpenAPI docs, built-in DI                               |
 | **SQLAlchemy 2.x async** over Tortoise | Tortoise ORM, raw asyncpg     | Mature ecosystem, migration support, 2.x async is production-stable                                    |
-| **BackgroundTasks** over Celery        | Celery + Redis broker          | Zero-infra overhead; Celery can be added later since Redis is already provisioned                      |
+| **Celery + Redis** over BackgroundTasks | FastAPI BackgroundTasks       | Tasks survive crashes (acks_late), support retries, expose state (`PENDING→SUCCESS`), and run in an isolated `worker` container — critical for 10–30 s LLM calls |
 | **ARRAY(Float)** over pgvector         | pgvector, Pinecone, Qdrant     | No extra extension; sufficient for <10k books; pgvector migration requires only IBookRepository change |
 | **5-strategy hybrid** over single      | Content-based only, CF only    | Hybrid avoids filter bubble; cold-start cascade handles new users; discovery mode gives user control   |
 | **3-layer preferences** over flat row  | Single user_preferences table  | Separates explicit/implicit/computed signals; richer recommendation input; extensible                  |
@@ -1001,8 +1101,8 @@ IStorageService`.  It never imports `LocalStorageService`, `S3StorageService`,
 
 | Target | Command | Purpose |
 |---|---|---|
-| `make up` | `docker-compose up --build` | Start all containers |
-| `make down` | `docker-compose down -v` | Stop + wipe data |
+| `make up` | `docker compose up -d --build` | Start all containers (api, worker, db, redis, minio, ollama, ollama-init) |
+| `make down` | `docker compose down -v` | Stop + wipe data |
 | `make test` | `pytest tests/ -v` | Run unit tests |
 | `make lint` | `mypy app/` + `flake8 app/` | Static analysis |
 | `make format` | `black app/ tests/` + `isort app/ tests/` | Auto-format |

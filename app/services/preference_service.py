@@ -31,6 +31,7 @@ from app.domain.repositories import (
     IUserPreferenceRepository,
     IUserTasteProfileRepository,
 )
+from app.domain.services import IPreferenceService
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ INTERACTION_WEIGHTS = {
 }
 
 
-class PreferenceService:
+class PreferenceService(IPreferenceService):
     """Orchestrates all three layers of user preferences.
 
     Responsibilities:
@@ -286,17 +287,12 @@ class PreferenceService:
             try:
                 top_authors = sorted(author_scores.items(), key=lambda x: -x[1])[:5]
                 top_genres = sorted(genre_scores.items(), key=lambda x: -x[1])[:5]
-                cluster_prompt = (
-                    f"Based on a reader's preferences:\n"
-                    f"Favorite authors: {', '.join(a for a, _ in top_authors)}\n"
-                    f"Favorite genres/tags: {', '.join(g for g, _ in top_genres)}\n"
-                    f"Average rating given: {avg_rating:.1f}/5\n"
-                    f"Books read: {total_borrows}\n\n"
-                    f"Generate a short (3-5 word) reader persona label, e.g. "
-                    f"'Literary Fiction Enthusiast' or 'Sci-Fi Power Reader'. "
-                    f"Respond with just the label."
+                taste_cluster = await self.llm_service.generate_taste_cluster_label(
+                    top_authors=[a for a, _ in top_authors],
+                    top_genres=[g for g, _ in top_genres],
+                    avg_rating=avg_rating,
+                    total_borrows=total_borrows,
                 )
-                taste_cluster = await self.llm_service.generate_summary(cluster_prompt)
                 taste_cluster = taste_cluster.strip().strip('"\'')[:100]
             except Exception as exc:
                 logger.warning("Failed to generate taste cluster: %s", exc)

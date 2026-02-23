@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends
 from app.api.schemas import BookResponse, RecommendationResponse, RecommendedBookResponse
 from app.core.dependencies import get_current_user, get_recommendation_service
 from app.domain.entities import User
-from app.services.recommendation import MLRecommendationService
+from app.domain.repositories import IRecommendationService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["recommendations"])
@@ -17,7 +17,7 @@ router = APIRouter(tags=["recommendations"])
 @router.get("/recommendations", response_model=RecommendationResponse)
 async def get_user_recommendations(
     current_user: Annotated[User, Depends(get_current_user)],
-    recommendation_service: Annotated[MLRecommendationService, Depends(get_recommendation_service)],
+    recommendation_service: Annotated[IRecommendationService, Depends(get_recommendation_service)],
     limit: int = 10,
 ) -> RecommendationResponse:
     """Get ML-based personalised book suggestions for the current user.

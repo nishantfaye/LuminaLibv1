@@ -23,7 +23,7 @@ from app.api.schemas import (
 )
 from app.core.dependencies import get_current_user, get_preference_service
 from app.domain.entities import User
-from app.services.preference_service import PreferenceService
+from app.domain.services import IPreferenceService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/preferences", tags=["preferences"])
@@ -37,7 +37,7 @@ router = APIRouter(prefix="/preferences", tags=["preferences"])
 @router.get("/", response_model=UserPreferenceResponse)
 async def get_preferences(
     current_user: Annotated[User, Depends(get_current_user)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> UserPreferenceResponse:
     """Get the authenticated user's explicit preferences."""
     pref = await pref_service.get_preferences(current_user.id)
@@ -58,7 +58,7 @@ async def get_preferences(
 async def update_preferences(
     body: UserPreferenceUpdateRequest,
     current_user: Annotated[User, Depends(get_current_user)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> UserPreferenceResponse:
     """Update (merge) the authenticated user's explicit preferences.
 
@@ -103,7 +103,7 @@ async def update_preferences(
 async def record_interaction(
     body: InteractionCreateRequest,
     current_user: Annotated[User, Depends(get_current_user)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> InteractionResponse:
     """Manually record a bookmark or view interaction.
 
@@ -121,7 +121,7 @@ async def record_interaction(
 @router.get("/interactions", response_model=list[InteractionResponse])
 async def get_interactions(
     current_user: Annotated[User, Depends(get_current_user)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
     interaction_type: Optional[str] = None,
     limit: int = 50,
 ) -> list[InteractionResponse]:
@@ -137,7 +137,7 @@ async def get_interactions(
 @router.get("/interactions/stats", response_model=InteractionStatsResponse)
 async def get_interaction_stats(
     current_user: Annotated[User, Depends(get_current_user)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> InteractionStatsResponse:
     """Get aggregated interaction statistics."""
     stats = await pref_service.get_interaction_stats(current_user.id)
@@ -152,7 +152,7 @@ async def get_interaction_stats(
 @router.get("/taste", response_model=TasteProfileResponse)
 async def get_taste_profile(
     current_user: Annotated[User, Depends(get_current_user)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> TasteProfileResponse:
     """Get the user's current computed taste profile (without recomputing)."""
     profile = await pref_service.get_taste_profile(current_user.id)
@@ -172,7 +172,7 @@ async def get_taste_profile(
 @router.post("/taste/recompute", response_model=TasteProfileResponse)
 async def recompute_taste_profile(
     current_user: Annotated[User, Depends(get_current_user)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> TasteProfileResponse:
     """Recompute the user's taste profile from all available data.
 
@@ -202,7 +202,7 @@ async def recompute_taste_profile(
 @router.get("/snapshot", response_model=PreferenceSnapshotResponse)
 async def get_preference_snapshot(
     current_user: Annotated[User, Depends(get_current_user)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> PreferenceSnapshotResponse:
     """Get a unified view combining all three preference layers.
 

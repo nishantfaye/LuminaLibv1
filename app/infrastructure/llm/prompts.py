@@ -107,13 +107,56 @@ EMBEDDING_PROMPT = PromptTemplate(
     user="Generate a dense vector representation for:\n\n{text}",
 )
 
+BOOK_METADATA_PROMPT = PromptTemplate(
+    name="book_metadata_extraction",
+    description="Extract title, author, and genre from the opening text of a book.",
+    version="1.0",
+    tags=["ingestion", "metadata", "extraction"],
+    system=(
+        "You are a metadata extraction assistant for a digital library. "
+        "Given the opening text of a book, extract its title, author, and genre. "
+        "Respond ONLY with a valid JSON object containing exactly these three keys: "
+        "'title', 'author', 'genre'. "
+        "If you cannot determine a value with confidence, use an empty string. "
+        "Do not include any explanation or markdown fencing — JSON only."
+    ),
+    user=(
+        "Extract the book metadata from this opening text:\n\n"
+        "{text}\n\n"
+        'Respond with JSON only, e.g. {{"title": "Dune", "author": "Frank Herbert", "genre": "science fiction"}}'
+    ),
+)
+
+TASTE_CLUSTER_PROMPT = PromptTemplate(
+    name="taste_cluster",
+    description="Generate a short reader persona label from a user's taste data.",
+    version="1.0",
+    tags=["preference", "persona", "taste"],
+    system=(
+        "You are LuminaLib's reader-profiling assistant. "
+        "Generate a concise, evocative reader persona label (3-5 words) that "
+        "captures the user's literary taste. "
+        "Respond with just the label — no explanation."
+    ),
+    user=(
+        "Favorite authors: {top_authors}\n"
+        "Favorite genres/tags: {top_genres}\n"
+        "Average rating given: {avg_rating}/5\n"
+        "Books read: {total_borrows}\n\n"
+        "Generate a short reader persona label, e.g. "
+        "'Literary Fiction Enthusiast' or 'Sci-Fi Power Reader'."
+    ),
+)
+
 # Registry for programmatic access
 PROMPT_REGISTRY: dict[str, PromptTemplate] = {
     tpl.name: tpl
     for tpl in [
         BOOK_SUMMARY_PROMPT,
+        BOOK_METADATA_PROMPT,
         SENTIMENT_ANALYSIS_PROMPT,
         REVIEW_CONSENSUS_PROMPT,
         EMBEDDING_PROMPT,
+        TASTE_CLUSTER_PROMPT,
     ]
 }

@@ -1,9 +1,12 @@
 """Authentication API routes."""
 
 import logging
+import time
 from typing import Annotated
 
+import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 
 from app.api.schemas import (
     LoginRequest,
@@ -13,9 +16,13 @@ from app.api.schemas import (
     UserResponse,
 )
 from app.core.dependencies import get_current_user, get_user_repository
+from app.core.redis_client import get_redis, revoke_token
+from app.core.security import decode_access_token
 from app.domain.entities import User
 from app.domain.repositories import IUserRepository
 from app.services.auth_service import AuthService
+
+_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -78,12 +85,22 @@ async def update_profile(
 @router.post("/signout", status_code=status.HTTP_200_OK)
 async def signout(
     current_user: Annotated[User, Depends(get_current_user)],
+    token: Annotated[str, Depends(_oauth2_scheme)],
+    redis_client: Annotated[aioredis.Redis, Depends(get_redis)],
 ) -> dict:
-    """
-    Sign out the current user.
+    """Sign out the current user.
 
-    Note: With stateless JWT the client simply discards the token.
-    A production system would maintain a token blacklist in Redis.
+    The token's ``jti`` is written to the Redis revocation blacklist with a
+    TTL equal to the token's remaining lifetime.  Subsequent requests carrying
+    this token will be rejected by ``get_current_user`` even before the JWT
+    expires naturally.
     """
-    logger.info(f"User signed out: {current_user.id}")
+    payload = decode_access_token(token)
+    if payload:
+        jti: str | None = payload.get("jti")
+        exp: int | None = payload.get("exp")
+        if jti and exp:
+            ttl = max(int(exp - time.time()), 1)
+            await revoke_token(redis_client, jti, ttl)
+            logger.info("Token jti=%s revoked (TTL=%ds) for user %s", jti, ttl, current_user.id)
     return {"detail": "Successfully signed out"}

@@ -1,12 +1,11 @@
 """Book API routes (CRUD, borrow, return, reviews, analysis, recommendations)."""
 
 import logging
-from typing import Annotated
+from typing import Annotated, Optional
 from uuid import UUID, uuid4
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -31,22 +30,18 @@ from app.core.dependencies import (
     get_book_service,
     get_borrow_repository,
     get_current_user,
-    get_llm_service,
     get_preference_service,
     get_recommendation_service,
     get_review_service,
 )
 from app.domain.entities import BorrowRecord, User
-from app.domain.repositories import IBorrowRepository
-from app.services.background_tasks import (
-    analyze_review_sentiment_task,
-    generate_book_summary_task,
-    update_rolling_consensus_task,
+from app.domain.repositories import IBorrowRepository, IRecommendationService
+from app.domain.services import IBookService, IPreferenceService, IReviewService
+from app.infrastructure.tasks.llm_tasks import (
+    analyze_review_sentiment,
+    generate_book_summary,
+    update_rolling_consensus,
 )
-from app.services.book_service import BookService
-from app.services.preference_service import PreferenceService
-from app.services.recommendation import MLRecommendationService
-from app.services.review_service import ReviewService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/books", tags=["books"])
@@ -57,19 +52,28 @@ router = APIRouter(prefix="/books", tags=["books"])
 # ---------------------------------------------------------------------------
 @router.post("/", response_model=BookResponse, status_code=status.HTTP_201_CREATED)
 async def create_book(
-    title: Annotated[str, Form()],
-    author: Annotated[str, Form()],
     file: Annotated[UploadFile, File()],
-    background_tasks: BackgroundTasks,
-    book_service: Annotated[BookService, Depends(get_book_service)],
+    response: Response,
+    book_service: Annotated[IBookService, Depends(get_book_service)],
     current_user: Annotated[User, Depends(get_current_user)],
-    genre: Annotated[str, Form()] = "general",
+    title: Annotated[Optional[str], Form()] = None,
+    author: Annotated[Optional[str], Form()] = None,
+    genre: Annotated[Optional[str], Form()] = None,
 ) -> BookResponse:
-    """Upload book file & metadata.
+    """Upload a book file — metadata is optional (content-first ingestion).
 
-    The book record is created immediately.  Summary & embedding generation
-    is dispatched as a **background task** so the client receives a fast
-    ``201 Created`` response while the LLM work runs asynchronously.
+    The file is the primary artifact.  Title, author, and genre are derived
+    automatically from the content when not supplied:
+
+    1. PDF built-in header fields (title / author / subject).
+    2. LLM extraction from the opening text of the file.
+    3. Fallback: filename stem, "Unknown Author", "general".
+
+    Caller-supplied values always override extracted values.
+
+    The book record is created immediately and the ``X-Task-ID`` header in
+    the response contains a Celery task ID that can be polled at
+    ``GET /tasks/{task_id}`` to track summary & embedding generation.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="File is required")
@@ -81,24 +85,18 @@ async def create_book(
     mime_type = file.content_type or "application/octet-stream"
     try:
         book = await book_service.create_book(
-            title=title,
-            author=author,
             file_content=file_content,
             filename=file.filename,
             mime_type=mime_type,
+            title=title,
+            author=author,
             genre=genre,
         )
 
-        # Dispatch background LLM summary + embedding generation
-        llm_service = get_llm_service()
-        background_tasks.add_task(
-            generate_book_summary_task,
-            book_id=str(book.id),
-            file_content=file_content,
-            mime_type=mime_type,
-            llm_service=llm_service,
-        )
-        logger.info("Background summary task dispatched for book %s", book.id)
+        # Dispatch summary + embedding generation to Celery worker
+        task = generate_book_summary.delay(str(book.id), mime_type)
+        response.headers["X-Task-ID"] = task.id
+        logger.info("Celery summary task %s dispatched for book %s", task.id, book.id)
 
         return BookResponse.model_validate(book)
     except Exception as e:
@@ -110,7 +108,7 @@ async def create_book(
 async def list_books(
     page: int = 1,
     limit: int = 20,
-    book_service: Annotated[BookService, Depends(get_book_service)] = ...,
+    book_service: Annotated[IBookService, Depends(get_book_service)] = ...,
     current_user: Annotated[User, Depends(get_current_user)] = ...,
 ) -> BookListResponse:
     """List books with pagination."""
@@ -128,7 +126,7 @@ async def list_books(
 @router.get("/{book_id}", response_model=BookResponse)
 async def get_book(
     book_id: UUID,
-    book_service: Annotated[BookService, Depends(get_book_service)],
+    book_service: Annotated[IBookService, Depends(get_book_service)],
     current_user: Annotated[User, Depends(get_current_user)] = ...,
 ) -> BookResponse:
     """Get a book by ID."""
@@ -142,7 +140,7 @@ async def get_book(
 async def update_book(
     book_id: UUID,
     body: BookUpdate,
-    book_service: Annotated[BookService, Depends(get_book_service)],
+    book_service: Annotated[IBookService, Depends(get_book_service)],
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> BookResponse:
     """Update book details."""
@@ -155,7 +153,7 @@ async def update_book(
 @router.delete("/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_book(
     book_id: UUID,
-    book_service: Annotated[BookService, Depends(get_book_service)],
+    book_service: Annotated[IBookService, Depends(get_book_service)],
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> None:
     """Remove book and associated file."""
@@ -167,7 +165,7 @@ async def delete_book(
 @router.get("/{book_id}/content")
 async def download_book_content(
     book_id: UUID,
-    book_service: Annotated[BookService, Depends(get_book_service)],
+    book_service: Annotated[IBookService, Depends(get_book_service)],
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> Response:
     """Download the stored book file content."""
@@ -186,14 +184,15 @@ async def download_book_content(
 async def update_book_content(
     book_id: UUID,
     file: Annotated[UploadFile, File()],
-    background_tasks: BackgroundTasks,
-    book_service: Annotated[BookService, Depends(get_book_service)],
+    response: Response,
+    book_service: Annotated[IBookService, Depends(get_book_service)],
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> BookResponse:
     """Replace the book's file content.
 
     The old file is deleted, the new file is stored, and summary & embedding
-    regeneration is dispatched as a background task.
+    regeneration is dispatched as a **Celery task**.  The task ID is returned
+    in the ``X-Task-ID`` response header.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="File is required")
@@ -211,16 +210,10 @@ async def update_book_content(
     if not updated:
         raise HTTPException(status_code=404, detail="Book not found")
 
-    # Regenerate summary & embedding for the new content
-    llm_service = get_llm_service()
-    background_tasks.add_task(
-        generate_book_summary_task,
-        book_id=str(book_id),
-        file_content=file_content,
-        mime_type=mime_type,
-        llm_service=llm_service,
-    )
-    logger.info("Background summary re-generation dispatched for book %s", book_id)
+    # Dispatch summary re-generation to Celery worker
+    task = generate_book_summary.delay(str(book_id), mime_type)
+    response.headers["X-Task-ID"] = task.id
+    logger.info("Celery summary re-generation task %s dispatched for book %s", task.id, book_id)
 
     return BookResponse.model_validate(updated)
 
@@ -234,9 +227,9 @@ async def update_book_content(
 async def borrow_book(
     book_id: UUID,
     current_user: Annotated[User, Depends(get_current_user)],
-    book_service: Annotated[BookService, Depends(get_book_service)],
+    book_service: Annotated[IBookService, Depends(get_book_service)],
     borrow_repo: Annotated[IBorrowRepository, Depends(get_borrow_repository)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> BorrowResponse:
     """User borrows a book."""
     book = await book_service.get_book(book_id)
@@ -269,7 +262,7 @@ async def return_book(
     book_id: UUID,
     current_user: Annotated[User, Depends(get_current_user)],
     borrow_repo: Annotated[IBorrowRepository, Depends(get_borrow_repository)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> BorrowResponse:
     """User returns a book."""
     active = await borrow_repo.get_active_borrow(current_user.id, book_id)
@@ -300,16 +293,17 @@ async def return_book(
 async def create_review(
     book_id: UUID,
     body: ReviewCreateRequest,
-    background_tasks: BackgroundTasks,
+    response: Response,
     current_user: Annotated[User, Depends(get_current_user)],
-    review_service: Annotated[ReviewService, Depends(get_review_service)],
-    pref_service: Annotated[PreferenceService, Depends(get_preference_service)],
+    review_service: Annotated[IReviewService, Depends(get_review_service)],
+    pref_service: Annotated[IPreferenceService, Depends(get_preference_service)],
 ) -> ReviewResponse:
     """Submit a review.
 
-    The review is persisted immediately.  Sentiment analysis is dispatched as
-    a **background task** so the response is fast.  User must have borrowed
-    the book.
+    The review is persisted immediately.  Sentiment analysis and rolling
+    consensus update are dispatched as **Celery tasks** so the response is
+    fast.  Task IDs are returned in ``X-Sentiment-Task-ID`` and
+    ``X-Consensus-Task-ID`` response headers.  User must have borrowed the book.
     """
     try:
         review = await review_service.create_review(
@@ -319,23 +313,15 @@ async def create_review(
             text=body.text,
         )
 
-        # Dispatch background sentiment analysis
-        llm_service = get_llm_service()
-        background_tasks.add_task(
-            analyze_review_sentiment_task,
-            review_id=str(review.id),
-            review_text=body.text,
-            llm_service=llm_service,
-        )
-        logger.info("Background sentiment task dispatched for review %s", review.id)
+        # Dispatch sentiment analysis to Celery worker
+        sentiment_task = analyze_review_sentiment.delay(str(review.id), body.text)
+        response.headers["X-Sentiment-Task-ID"] = sentiment_task.id
+        logger.info("Celery sentiment task %s dispatched for review %s", sentiment_task.id, review.id)
 
-        # Dispatch background rolling consensus update
-        background_tasks.add_task(
-            update_rolling_consensus_task,
-            book_id=str(book_id),
-            llm_service=llm_service,
-        )
-        logger.info("Background consensus task dispatched for book %s", book_id)
+        # Dispatch rolling consensus update to Celery worker
+        consensus_task = update_rolling_consensus.delay(str(book_id))
+        response.headers["X-Consensus-Task-ID"] = consensus_task.id
+        logger.info("Celery consensus task %s dispatched for book %s", consensus_task.id, book_id)
 
         # Record implicit interaction (Layer 2)
         try:
@@ -358,7 +344,7 @@ async def create_review(
 @router.get("/{book_id}/analysis", response_model=BookAnalysisResponse)
 async def get_book_analysis(
     book_id: UUID,
-    review_service: Annotated[ReviewService, Depends(get_review_service)],
+    review_service: Annotated[IReviewService, Depends(get_review_service)],
     current_user: Annotated[User, Depends(get_current_user)] = ...,
 ) -> BookAnalysisResponse:
     """Get GenAI-aggregated summary of all reviews."""
@@ -377,7 +363,7 @@ async def get_book_recommendations(
     book_id: UUID,
     limit: int = 5,
     recommendation_service: Annotated[
-        MLRecommendationService, Depends(get_recommendation_service)
+        IRecommendationService, Depends(get_recommendation_service)
     ] = ...,
     current_user: Annotated[User, Depends(get_current_user)] = ...,
 ) -> RecommendationResponse:
